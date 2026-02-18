@@ -1,6 +1,6 @@
 # Understanding VS. Generation: Navigating Optimization Dilemma in Multimodal Models
 
-This repository contains the code for the paper [Understanding VS. Generation: Navigating Optimization Dilemma in Multimodal Models]()
+This repository contains the code for the paper [Understanding VS. Generation: Navigating Optimization Dilemma in Multimodal Models](https://arxiv.org/abs/2602.15772)
 
 > **Understanding VS. Generation: Navigating Optimization Dilemma in Multimodal Models**   
 > Sen Ye, Mengde Xu, Shuyang Gu, Di He, Liwei Wang, Han Hu   
@@ -32,5 +32,13 @@ We provide a doc in tutorial.md detailing how to train R3 on various datasets.
 ## Citation
 If you find this work useful, please consider citing:
 ```bibtex
-
+@misc{ye2026understandingvsgenerationnavigating,
+      title={Understanding vs. Generation: Navigating Optimization Dilemma in Multimodal Models}, 
+      author={Sen Ye and Mengde Xu and Shuyang Gu and Di He and Liwei Wang and Han Hu},
+      year={2026},
+      eprint={2602.15772},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2602.15772}, 
+}
 ```
