@@ -1,7 +1,6 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
-import functools
 import os, sys, json
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -11,11 +10,6 @@ from datetime import timedelta
 import torch
 from typing import List
 import torch.distributed as dist
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl,
-    apply_activation_checkpointing,
-    checkpoint_wrapper,
-)
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, set_seed
 from transformers.optimization import (
@@ -46,10 +40,14 @@ from train.train_utils import (
 )
 from train.fsdp_utils import (
     FSDPCheckpoint,
-    FSDPConfig,
-    grad_checkpoint_check_fn,
-    fsdp_wrapper,
-    fsdp_ema_update,
+)
+from train.fsdp2_utils import (
+    FSDP2Checkpoint,
+    FSDP2Config,
+    apply_fsdp2_with_activation_checkpointing,
+    clip_grad_norm_fsdp2,
+    fsdp2_ema_update,
+    fsdp2_lazy_init_root,
 )
 from train.rollout_controller import MultiRoundRolloutController,RolloutStepResult
 from train.data_utils import (
@@ -106,10 +104,10 @@ class DataArguments:
     vit_max_image_size: int = field(default=504)
     vit_min_image_size: int = field(default=252)
     vit_image_stride: int = field(default=14)
-    data_path: str = field(default="/mnt/private_senye/Bagel_grpo/data/geneval")
+    data_path: str = field(default="prompts.txt")
     dataset_name: str = field(default="hps")
-    train_data_path: str = field(default="/mnt/private_senye/Bagel_edit/data/hps/prompts_train.txt")
-    val_data_path: str = field(default="/mnt/private_senye/Bagel_edit/data/hps/prompts_val.txt")
+    train_data_path: str = field(default="prompts_train.txt")
+    val_data_path: str = field(default="prompts_val.txt")
 
 
 @dataclass
@@ -117,13 +115,14 @@ class TrainingArguments:
     debug: bool = field(default=False)
     exp_name: str = field(default="")
 
+    log_dir: str = field(default="your_exps/")
     visual_gen: bool = field(default=True)
     visual_und: bool = field(default=True)
 
     mydir: str = field(default="")
     results_dir: str = field(default="results")
     checkpoint_dir: str = field(default="results/checkpoints")
-    wandb_project: str = field(default="R3_bagel")
+    wandb_project: str = field(default="interleave_thinking")
     wandb_name: str = field(default="run")
     wandb_runid: str = field(default="trial")
     wandb_resume: str = field(default="allow")
@@ -146,7 +145,7 @@ class TrainingArguments:
     weight_decay: float = field(default=0)
     eps: float = field(default=1e-15)
     ema: float = field(default=0)
-    max_grad_norm: int = field(default=1.0)
+    max_grad_norm: float = field(default=1.0)
     mse_weight: float = field(default=1.0)
     ce_weight: float = field(default=1.0)
     ce_loss_reweighting: bool = field(default=False)
@@ -183,6 +182,7 @@ class TrainingArguments:
     pack_start_round_idx: int = field(default=0) # 从第几轮开始打包rollout结果为train input
     enable_sde_gen: bool = field(default=True)
     enable_sde_edit: bool = field(default=True)
+    grpo_clip_ratio: float = field(default=0.2)
 
     # reward server specific parameters
     reward_server_urls: str = field(
@@ -201,6 +201,8 @@ class TrainingArguments:
     do_sample: bool = field(default=True)
     text_temperature: float = field(default=0.8)
     top_k: int = field(default=-1)
+    top_p: float = field(default=0.9)
+    use_static_kv_cache: bool = field(default=True)
     cfg_text_scale: float = field(default=4.0)
     cfg_img_scale: float = field(default=1.5)
     cfg_interval: tuple = field(default=(0.4, 1.0))
@@ -220,219 +222,249 @@ class TrainingArguments:
     resume_step: int = field(default=-1)
 
 
-def evaluate_geneval_raw_multi_round(val_dataset: GenevalPromptDataset, rollout_controller: MultiRoundRolloutController, 
-                 training_args: TrainingArguments, data_args: DataArguments, curr_step: int, generation_kwargs: dict=None, eval_batch_size: int=16, eval_rounds: int=4):
+def build_debug_reward_fns(reward_fn_name: str):
+    if reward_fn_name == "geneval":
+        def _geneval_reward(images, prompts, metadatas, only_strict=False, return_reason=False):
+            del prompts, metadatas, only_strict, return_reason
+            batch_size = len(images)
+            zeros = [0.0] * batch_size
+            return zeros, zeros, zeros, {}, {}
+
+        return _geneval_reward, _geneval_reward
+
+    if reward_fn_name == "geneval_plus":
+        def _geneval_plus_reward(image, prompt, metadata, return_reason: bool = False):
+            del image, prompt, metadata, return_reason
+            return 0.0, ""
+
+        return _geneval_plus_reward, _geneval_plus_reward
+
+    if reward_fn_name == "tiif":
+        def _tiif_reward(image, prompt, metadata, return_reason: bool = False):
+            del image, prompt, metadata, return_reason
+            return 0.0
+
+        return _tiif_reward, _tiif_reward
+
+    raise ValueError(f"Invalid reward function for debug mode: {reward_fn_name}")
+
+
+def gather_text_policy_logps(
+    logits: torch.Tensor,
+    label_ids: torch.LongTensor,
+    *,
+    do_sample: bool,
+    temperature: float,
+    topk: int,
+    top_p: float,
+) -> torch.Tensor:
+    del do_sample, temperature, topk, top_p
+    return (
+        logits.log_softmax(dim=-1)
+        .gather(dim=-1, index=label_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+
+DATASET_EVAL_KEYS = {
+    "geneval": [
+        "single_object", "two_object", "counting", "colors", "position", "color_attr",
+    ],
+    "geneval_plus": [
+        "color_attr", "spatial_count_attr", "color_spatial_attr", "color_count_attr",
+        "multi_object_count_attr", "size_spatial_attr", "counting",
+    ],
+    "tiif": [
+        "numeracy+2d", "comparison", "action+texture", "comparison+3d", "texture+color",
+        "numeracy+3d", "numeracy", "action+2d", "color+3d", "color+texture",
+        "differentiation+3d", "comparison+2d", "shape+2d", "negation+3d", "comparison+texture",
+        "3d_spatial_relation", "shape+3d", "negation+2d", "differentiation", "negation+color",
+        "action+color", "text", "texture+2d", "differentiation+color", "real_world",
+        "differentiation+2d", "action+3d", "2d_spatial_relation", "numeracy+texture", "color+2d",
+        "differentiation+texture", "negation", "negation+texture", "comparison+color",
+        "shape+texture", "style", "shape+color", "texture+3d", "numeracy+color",
+    ],
+}
+
+METADATA_TAG_KEY = {
+    "geneval": "tag",
+    "geneval_plus": "tag",
+    "tiif": "type",
+}
+
+_REFLECTION_TEMPLATE = (
+    "The description of the target image is: {prompt}\n"
+    "How to further edit the provided image to make it consistent with the target description? "
+    "Please provide concrete editing instructions in a single sentence. "
+    "If no editing operation is needed, answer: no further edit needed."
+)
+
+
+def _extract_reward_value(reward_result, dataset_name: str):
+    """Extract scalar reward value from the async reward future result."""
+    if dataset_name == "geneval":
+        _scores, rewards, _strict, _group_dict, _group_strict_dict = reward_result
+        return rewards[0]
+    elif dataset_name == "geneval_plus":
+        return reward_result[0]
+    elif dataset_name == "tiif":
+        return reward_result
+    raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def evaluate_multi_round(
+    val_dataset,
+    rollout_controller: MultiRoundRolloutController,
+    training_args: TrainingArguments,
+    data_args: DataArguments,
+    curr_step: int,
+    generation_kwargs: dict = None,
+    eval_batch_size: int = 16,
+    eval_rounds: int = 4,
+):
+    dataset_name = data_args.dataset_name
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     validation_set_len = len(val_dataset)
-    number_val_per_rank = (validation_set_len + world_size - 1) // world_size
-    start_idx = rank * number_val_per_rank
-    end_idx = start_idx + number_val_per_rank
-    if end_idx > validation_set_len:
-        end_idx = validation_set_len
-    val_data = [val_dataset.__getitem__(i) for i in range(start_idx, end_idx)]
+    if validation_set_len == 0:
+        return {}
+    base_val_per_rank = validation_set_len // world_size
+    remainder = validation_set_len % world_size
+    start_idx = rank * base_val_per_rank + min(rank, remainder)
+    end_idx = start_idx + base_val_per_rank + (1 if rank < remainder else 0)
+    val_data = [val_dataset[i] for i in range(start_idx, end_idx)]
     val_prompts = [item['prompt'] for item in val_data]
     val_metadata = [item['metadata'] for item in val_data]
 
-    reflection_system_prompt = '''The description of the target image is: {prompt}\nHow to further edit the provided image to make it consistent with the target description? Please provide concrete editing instructions in a single sentence. If no editing operation is needed, answer: no further edit needed.'''
-    reflection_system_prompt = [reflection_system_prompt.format(prompt=prompt) for prompt in val_prompts]
-    if data_args.dataset_name == "geneval":
-        dataset_keys = ["single_object", "two_object", "counting", "colors", "position", "color_attr"]
-    elif data_args.dataset_name == "geneval_plus":
-        dataset_keys = ["color_attr", "spatial_count_attr", "color_spatial_attr", "color_count_attr", "multi_object_count_attr", "size_spatial_attr", "counting"]
-    round_eval_stats = [EvalStats(basic_info=[{"Round": round_idx}], track_keys=dataset_keys) for round_idx in range(eval_rounds)]
-    round_improve_stats = [EvalStats(basic_info=[{"Round": round_idx}], track_keys=["improved", "worse", "no_change"]) for round_idx in range(eval_rounds)]
+    reflection_prompts = [_REFLECTION_TEMPLATE.format(prompt=p) for p in val_prompts]
+    dataset_keys = DATASET_EVAL_KEYS[dataset_name]
+    tag_key = METADATA_TAG_KEY[dataset_name]
+
+    round_eval_stats = [
+        EvalStats(basic_info=[{"Round": r}], track_keys=dataset_keys)
+        for r in range(eval_rounds)
+    ]
+    round_improve_stats = [
+        EvalStats(basic_info=[{"Round": r}], track_keys=["improved", "worse", "no_change"])
+        for r in range(eval_rounds)
+    ]
     round_format_rewards = [[] for _ in range(eval_rounds)]
     round_mean_cot_length = [[] for _ in range(eval_rounds)]
     round_improve_rewards = [0.0 for _ in range(eval_rounds)]
     finished_cnt = 0
     finished_steps = 0
-    finish_stats = {}
-    for round_idx in range(eval_rounds):
-        finish_stats[f"Round_{round_idx}_finished_cnt"] = 0
+    finish_stats = {f"Round_{r}_finished_cnt": 0 for r in range(eval_rounds)}
+    last_batch_results = None
+
+    def _distributed_mean(values: list[float]) -> float:
+        local_sum = torch.tensor(sum(values), dtype=torch.float, device="cuda")
+        local_count = torch.tensor(len(values), dtype=torch.float, device="cuda")
+        dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+        if local_count.item() == 0:
+            return 0.0
+        return (local_sum / local_count).item()
 
     with rollout_controller.context():
         for i in range(0, len(val_prompts), eval_batch_size):
             g = torch.Generator(device="cuda")
-            g.manual_seed((rank + 1) * (len(val_prompts)//eval_batch_size + 1) + i)
-            num_image_tokens = generation_kwargs["image_shapes"][0] * generation_kwargs["image_shapes"][1] // 16**2
-            generation_kwargs["initial_noise"] = [torch.randn(
-                num_image_tokens, 64, dtype=torch.bfloat16, generator=g, device="cuda"
-            ) for _ in range(eval_rounds)]
-            batch_prompts = val_prompts[i:i+eval_batch_size]
-            batch_metadata = val_metadata[i:i+eval_batch_size]
-            batch_reflection_system_prompt = reflection_system_prompt[i:i+eval_batch_size]
+            g.manual_seed((rank + 1) * (len(val_prompts) // eval_batch_size + 1) + i)
+            num_image_tokens = (
+                generation_kwargs["image_shapes"][0]
+                * generation_kwargs["image_shapes"][1]
+                // 16**2
+            )
+            generation_kwargs["initial_noise"] = [
+                torch.randn(num_image_tokens, 64, dtype=torch.bfloat16, generator=g, device="cuda")
+                for _ in range(eval_rounds)
+            ]
+            batch_prompts = val_prompts[i:i + eval_batch_size]
+            batch_metadata = val_metadata[i:i + eval_batch_size]
+            batch_reflection = reflection_prompts[i:i + eval_batch_size]
             batch_results = rollout_controller.rollout_for_eval(
                 rounds=eval_rounds,
                 prompts=batch_prompts,
-                reflection_prompts=batch_reflection_system_prompt,
+                reflection_prompts=batch_reflection,
                 prompt_metadata=batch_metadata,
                 generator=g,
                 **generation_kwargs,
             )
+            last_batch_results = batch_results
+
             for round_idx in range(eval_rounds):
-                round_mean_cot_length[round_idx].append(batch_results[f"Round_{round_idx}/mean_cot_length"])
+                round_mean_cot_length[round_idx].append(
+                    batch_results[f"Round_{round_idx}/mean_cot_length"]
+                )
 
             for sample_idx, per_sample_reward in enumerate(batch_results["per_sample_rewards"]):
                 finished_cnt += int(batch_results["per_sample_finished"][sample_idx])
                 finished_step = batch_results["per_sample_finished_steps"][sample_idx]
-                finished_steps += int(batch_results["per_sample_finished_steps"][sample_idx])
-                finish_stats[f"Round_{finished_step-1}_finished_cnt"] += 1
+                finished_steps += int(finished_step)
+                finish_stats[f"Round_{finished_step - 1}_finished_cnt"] += 1
+
                 for round_idx, per_round_reward in enumerate(per_sample_reward):
-                    if data_args.dataset_name == "geneval":
-                        all_scores, all_rewards, all_strict_rewards, all_group_rewards_dict, all_group_strict_rewards_dict = per_round_reward.result()
-                    elif data_args.dataset_name == "geneval_plus":
-                        all_rewards = per_round_reward.result()
-                    per_sample_reward[round_idx] = all_rewards[0]
-                    tag = batch_metadata[sample_idx]['tag']
-                    round_eval_stats[round_idx].update(tag, all_rewards[0])
-                    round_format_rewards[round_idx].append(batch_results["per_sample_format_rewards"][sample_idx][round_idx])
+                    reward_value = _extract_reward_value(per_round_reward.result(), dataset_name)
+                    per_sample_reward[round_idx] = reward_value
+                    tag = batch_metadata[sample_idx][tag_key]
+                    round_eval_stats[round_idx].update(tag, reward_value)
+                    round_format_rewards[round_idx].append(
+                        batch_results["per_sample_format_rewards"][sample_idx][round_idx]
+                    )
                     if round_idx > 0:
-                        last_round_reward = int(batch_results["per_sample_rewards"][sample_idx][round_idx - 1])
-                        this_round_reward = int(batch_results["per_sample_rewards"][sample_idx][round_idx])
-                        round_improve_rewards[round_idx] += (this_round_reward - last_round_reward) / validation_set_len
-                        if this_round_reward > last_round_reward:
+                        prev_reward = int(per_sample_reward[round_idx - 1])
+                        curr_reward = int(per_sample_reward[round_idx])
+                        delta = curr_reward - prev_reward
+                        round_improve_rewards[round_idx] += delta / validation_set_len
+                        if delta > 0:
                             round_improve_stats[round_idx].update("improved", 1 / validation_set_len)
-                        elif this_round_reward < last_round_reward:
+                        elif delta < 0:
                             round_improve_stats[round_idx].update("worse", 1 / validation_set_len)
                         else:
                             round_improve_stats[round_idx].update("no_change", 1 / validation_set_len)
 
     eval_log = {}
-    save_inference_results(batch_results, curr_step, training_args.results_dir, mode="eval", num_samples_to_save=8)
+    if last_batch_results is not None:
+        save_inference_results(
+            last_batch_results, curr_step, training_args.results_dir, mode="eval", num_samples_to_save=8
+        )
     log_stats = [stat.aggregate() for stat in round_eval_stats]
-    round_improve_stats = [stat.aggregate(normalize=False, log_overall=False) for stat in round_improve_stats]
+    round_improve_stats = [
+        stat.aggregate(normalize=False, log_overall=False) for stat in round_improve_stats
+    ]
     finished_cnt = torch.tensor(finished_cnt, device="cuda", dtype=torch.float) / validation_set_len
     finished_steps = torch.tensor(finished_steps, device="cuda", dtype=torch.float) / validation_set_len
     dist.all_reduce(finished_cnt, op=dist.ReduceOp.SUM)
     dist.all_reduce(finished_steps, op=dist.ReduceOp.SUM)
-    eval_log[f"Eval_{data_args.dataset_name}/Finished_rate"] = finished_cnt.item()
-    eval_log[f"Eval_{data_args.dataset_name}/Finished_steps"] = finished_steps.item()
+    eval_log[f"Eval_{dataset_name}/Finished_rate"] = finished_cnt.item()
+    eval_log[f"Eval_{dataset_name}/Finished_steps"] = finished_steps.item()
     for round_idx in range(eval_rounds):
-        round_format_mean = torch.tensor(round_format_rewards[round_idx], dtype=torch.float, device="cuda").mean()
-        mean_cot_length = torch.tensor(round_mean_cot_length[round_idx], dtype=torch.float, device="cuda").mean()
-        dist.all_reduce(round_format_mean, op=dist.ReduceOp.AVG)
-        dist.all_reduce(mean_cot_length, op=dist.ReduceOp.AVG)
-        eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}_format_reward_mean"] = round_format_mean.item()
-        eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}_mean_cot_length"] = mean_cot_length.item()
+        eval_log[f"Eval_{dataset_name}/Round_{round_idx}_format_reward_mean"] = _distributed_mean(
+            round_format_rewards[round_idx]
+        )
+        eval_log[f"Eval_{dataset_name}/Round_{round_idx}_mean_cot_length"] = _distributed_mean(
+            round_mean_cot_length[round_idx]
+        )
         for key, value in log_stats[round_idx].items():
-            eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}/{key}"] = value
+            eval_log[f"Eval_{dataset_name}/Round_{round_idx}/{key}"] = value
         for key, value in round_improve_stats[round_idx].items():
-            eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}/{key}"] = value
+            eval_log[f"Eval_{dataset_name}/Round_{round_idx}/{key}"] = value
         if round_idx > 0:
-            round_improve_rewards[round_idx] = torch.tensor(round_improve_rewards[round_idx], dtype=torch.float32, device="cuda")
-            dist.all_reduce(round_improve_rewards[round_idx], op=dist.ReduceOp.SUM)
-            eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}_vs_{round_idx-1}"] = round_improve_rewards[round_idx].item()
-    for key, value in finish_stats.items():
-        value = torch.tensor(value, device="cuda", dtype=torch.float)
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        eval_log[f"Eval_{data_args.dataset_name}/{key}"] = value.item() / validation_set_len
-    return eval_log
-
-
-
-def evaluate_tiif_raw_multi_round(val_dataset: TIIFDataset, rollout_controller: MultiRoundRolloutController, 
-                 training_args: TrainingArguments, data_args: DataArguments, curr_step: int, generation_kwargs: dict=None, eval_batch_size: int=16, eval_rounds: int=4):
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    validation_set_len = len(val_dataset)
-    number_val_per_rank = (validation_set_len + world_size - 1) // world_size
-    start_idx = rank * number_val_per_rank
-    end_idx = start_idx + number_val_per_rank
-    if end_idx > validation_set_len:
-        end_idx = validation_set_len
-    val_data = [val_dataset.__getitem__(i) for i in range(start_idx, end_idx)]
-    val_prompts = [item['prompt'] for item in val_data]
-    val_metadata = [item['metadata'] for item in val_data]
-
-    reflection_system_prompt = '''The description of the target image is: {prompt}\nHow to further edit the provided image to make it consistent with the target description? Please provide concrete editing instructions in a single sentence. If no editing operation is needed, answer: no further edit needed.'''
-    reflection_system_prompt = [reflection_system_prompt.format(prompt=prompt) for prompt in val_prompts]
-    dataset_keys = ['numeracy+2d', 'comparison', 'action+texture', 'comparison+3d', 'texture+color', 'numeracy+3d', 'numeracy', 'action+2d', 'color+3d', 'color+texture', 'differentiation+3d', 'comparison+2d', 'shape+2d', 'negation+3d', 'comparison+texture', '3d_spatial_relation', 'shape+3d', 'negation+2d', 'differentiation', 'negation+color', 'action+color', 'text', 'texture+2d', 'differentiation+color', 'real_world', 'differentiation+2d', 'action+3d', '2d_spatial_relation', 'numeracy+texture', 'color+2d', 'differentiation+texture', 'negation', 'negation+texture', 'comparison+color', 'shape+texture', 'style', 'shape+color', 'texture+3d', 'numeracy+color']
-    round_eval_stats = [EvalStats(basic_info=[{"Round": round_idx}], track_keys=dataset_keys) for round_idx in range(eval_rounds)]
-    round_improve_stats = [EvalStats(basic_info=[{"Round": round_idx}], track_keys=["improved", "worse", "no_change"]) for round_idx in range(eval_rounds)]
-    round_format_rewards = [[] for _ in range(eval_rounds)]
-    round_mean_cot_length = [[] for _ in range(eval_rounds)]
-    round_improve_rewards = [0.0 for _ in range(eval_rounds)]
-    finished_cnt = 0
-    finished_steps = 0
-    finish_stats = {}
-    for round_idx in range(eval_rounds):
-        finish_stats[f"Round_{round_idx}_finished_cnt"] = 0
-
-    with rollout_controller.context():
-        for i in range(0, len(val_prompts), eval_batch_size):
-            g = torch.Generator(device="cuda")
-            g.manual_seed((rank + 1) * (len(val_prompts)//eval_batch_size + 1) + i)
-            num_image_tokens = generation_kwargs["image_shapes"][0] * generation_kwargs["image_shapes"][1] // 16**2
-            generation_kwargs["initial_noise"] = [torch.randn(
-                num_image_tokens, 64, dtype=torch.bfloat16, generator=g, device="cuda"
-            ) for _ in range(eval_rounds)]
-            batch_prompts = val_prompts[i:i+eval_batch_size]
-            batch_metadata = val_metadata[i:i+eval_batch_size]
-            batch_reflection_system_prompt = reflection_system_prompt[i:i+eval_batch_size]
-            batch_results = rollout_controller.rollout_for_eval(
-                rounds=eval_rounds,
-                prompts=batch_prompts,
-                reflection_prompts=batch_reflection_system_prompt,
-                prompt_metadata=batch_metadata,
-                generator=g,
-                **generation_kwargs,
+            round_improve_rewards[round_idx] = torch.tensor(
+                round_improve_rewards[round_idx], dtype=torch.float32, device="cuda"
             )
-            for round_idx in range(eval_rounds):
-                round_mean_cot_length[round_idx].append(batch_results[f"Round_{round_idx}/mean_cot_length"])
-
-            for sample_idx, per_sample_reward in enumerate(batch_results["per_sample_rewards"]):
-                finished_cnt += int(batch_results["per_sample_finished"][sample_idx])
-                finished_step = batch_results["per_sample_finished_steps"][sample_idx]
-                finished_steps += int(batch_results["per_sample_finished_steps"][sample_idx])
-                finish_stats[f"Round_{finished_step-1}_finished_cnt"] += 1
-                for round_idx, per_round_reward in enumerate(per_sample_reward):
-                    all_rewards = per_round_reward.result()
-                    per_sample_reward[round_idx] = all_rewards
-                    tag = batch_metadata[sample_idx]['type']
-                    round_eval_stats[round_idx].update(tag, all_rewards)
-                    round_format_rewards[round_idx].append(batch_results["per_sample_format_rewards"][sample_idx][round_idx])
-                    if round_idx > 0:
-                        last_round_reward = int(batch_results["per_sample_rewards"][sample_idx][round_idx - 1])
-                        this_round_reward = int(batch_results["per_sample_rewards"][sample_idx][round_idx])
-                        round_improve_rewards[round_idx] += (this_round_reward - last_round_reward) / validation_set_len
-                        if this_round_reward > last_round_reward:
-                            round_improve_stats[round_idx].update("improved", 1 / validation_set_len)
-                        elif this_round_reward < last_round_reward:
-                            round_improve_stats[round_idx].update("worse", 1 / validation_set_len)
-                        else:
-                            round_improve_stats[round_idx].update("no_change", 1 / validation_set_len)
-
-    eval_log = {}
-    save_inference_results(batch_results, curr_step, training_args.results_dir, mode="eval", num_samples_to_save=8)
-    log_stats = [stat.aggregate() for stat in round_eval_stats]
-    round_improve_stats = [stat.aggregate(normalize=False, log_overall=False) for stat in round_improve_stats]
-    finished_cnt = torch.tensor(finished_cnt, device="cuda", dtype=torch.float) / validation_set_len
-    finished_steps = torch.tensor(finished_steps, device="cuda", dtype=torch.float) / validation_set_len
-    dist.all_reduce(finished_cnt, op=dist.ReduceOp.SUM)
-    dist.all_reduce(finished_steps, op=dist.ReduceOp.SUM)
-    eval_log[f"Eval_{data_args.dataset_name}/Finished_rate"] = finished_cnt.item()
-    eval_log[f"Eval_{data_args.dataset_name}/Finished_steps"] = finished_steps.item()
-    for round_idx in range(eval_rounds):
-        round_format_mean = torch.tensor(round_format_rewards[round_idx], dtype=torch.float, device="cuda").mean()
-        mean_cot_length = torch.tensor(round_mean_cot_length[round_idx], dtype=torch.float, device="cuda").mean()
-        dist.all_reduce(round_format_mean, op=dist.ReduceOp.AVG)
-        dist.all_reduce(mean_cot_length, op=dist.ReduceOp.AVG)
-        eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}_format_reward_mean"] = round_format_mean.item()
-        eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}_mean_cot_length"] = mean_cot_length.item()
-        for key, value in log_stats[round_idx].items():
-            eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}/{key}"] = value
-        for key, value in round_improve_stats[round_idx].items():
-            eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}/{key}"] = value
-        if round_idx > 0:
-            round_improve_rewards[round_idx] = torch.tensor(round_improve_rewards[round_idx], dtype=torch.float32, device="cuda")
             dist.all_reduce(round_improve_rewards[round_idx], op=dist.ReduceOp.SUM)
-            eval_log[f"Eval_{data_args.dataset_name}/Round_{round_idx}_vs_{round_idx-1}"] = round_improve_rewards[round_idx].item()
+            eval_log[f"Eval_{dataset_name}/Round_{round_idx}_vs_{round_idx-1}"] = (
+                round_improve_rewards[round_idx].item()
+            )
     for key, value in finish_stats.items():
         value = torch.tensor(value, device="cuda", dtype=torch.float)
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        eval_log[f"Eval_{data_args.dataset_name}/{key}"] = value.item() / validation_set_len
+        eval_log[f"Eval_{dataset_name}/{key}"] = value.item() / validation_set_len
     return eval_log
+
+
+evaluate_geneval_raw_multi_round = evaluate_multi_round
+evaluate_tiif_raw_multi_round = evaluate_multi_round
 
 
 def save_inference_results(inference_results, curr_step, results_dir, mode="train", num_samples_to_save=2, timestep_idx=None, last_reward=None, change_summary=None):
@@ -536,14 +568,37 @@ def main():
     model_args, data_args, training_args = args
 
     training_args.cfg_interval = (training_args.cfg_interval_low, training_args.cfg_interval_high)
-    # Setup logging:
+    if not training_args.exp_name:
+        training_args.exp_name = training_args.wandb_name
+
+    if training_args.log_dir:
+        training_args.log_dir = os.path.abspath(training_args.log_dir)
+        training_args.mydir = training_args.log_dir
+        training_args.results_dir = os.path.join(
+            training_args.log_dir,
+            training_args.wandb_project,
+            training_args.exp_name,
+        )
+        training_args.checkpoint_dir = os.path.join(
+            training_args.results_dir,
+            "ckpts",
+        )
+    else:
+        training_args.checkpoint_dir = os.path.abspath(
+            os.path.join(training_args.mydir, training_args.checkpoint_dir)
+        )
+        training_args.results_dir = os.path.abspath(
+            os.path.join(training_args.mydir, training_args.results_dir)
+        )
+
     if dist.get_rank() == 0:
+        os.makedirs(training_args.checkpoint_dir, exist_ok=True)
+        os.makedirs(training_args.results_dir, exist_ok=True)
         logger = create_logger(training_args.results_dir, dist.get_rank())
         wandb.init(
             project=training_args.wandb_project,
             id=f"{training_args.wandb_name}-run{training_args.wandb_runid}",
             name=training_args.wandb_name,
-            resume=training_args.wandb_resume,
             mode="offline" if training_args.wandb_offline else "online",
         )
         wandb.config.update(training_args, allow_val_change=True)
@@ -554,18 +609,15 @@ def main():
     logger.info(f"Training arguments {training_args}")
     logger.info(f"Model arguments {model_args}")
     logger.info(f"Data arguments {data_args}")
-    # update checkppoint dir, absolute path
-    training_args.checkpoint_dir = os.path.abspath(
-        os.path.join(training_args.mydir, training_args.checkpoint_dir)
-    )
-    training_args.results_dir = os.path.abspath(
-        os.path.join(training_args.mydir, training_args.results_dir)
-    )
-    if dist.get_rank() == 0:
-        os.makedirs(training_args.checkpoint_dir, exist_ok=True)
-        os.makedirs(training_args.results_dir, exist_ok=True)
     logger.info(f"checkpoint_dir: {training_args.checkpoint_dir}")
     logger.info(f"results_dir: {training_args.results_dir}")
+
+    def _format_reward_base_url(host: str, port: str) -> str:
+        host = host.strip()
+        port = port.strip()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"http://{host}:{port}/v1"
 
     if training_args.reward_server_port == "-1":
         # update reward server urls for using external service, e.g. openai, gemini, etc.
@@ -577,14 +629,33 @@ def main():
         reward_urls = []
         for url in reward_server_urls:
             for port in reward_server_port:
-                reward_urls.append(f"http://{url}:{port}/v1")
+                reward_urls.append(_format_reward_base_url(url, port))
     logger.info(f"reward_urls: {reward_urls}")
 
-    if dist.get_world_size() % training_args.num_shard != 0:
-        raise ValueError(
-            f"World size {dist.get_world_size()} must be divisible by num_shard {training_args.num_shard}"
-        )
-    training_args.num_replicate = dist.get_world_size() // training_args.num_shard
+    world_size = dist.get_world_size()
+    if training_args.num_shard <= 0:
+        raise ValueError(f"num_shard must be positive, got {training_args.num_shard}")
+    normalized_sharding_strategy = (
+        "FULL_SHARD"
+        if training_args.sharding_strategy == "SHARD_GRAD_OP"
+        else training_args.sharding_strategy
+    )
+    if normalized_sharding_strategy == "HYBRID_SHARD":
+        if world_size % training_args.num_shard != 0:
+            raise ValueError(
+                f"World size {world_size} must be divisible by num_shard {training_args.num_shard}"
+            )
+        training_args.num_replicate = world_size // training_args.num_shard
+    else:
+        training_args.num_replicate = max(1, world_size // training_args.num_shard)
+    logger.info(
+        "Resolved FSDP2 mesh config: "
+        f"world_size={world_size}, "
+        f"sharding_strategy={training_args.sharding_strategy}, "
+        f"num_shard={training_args.num_shard}, "
+        f"num_replicate={training_args.num_replicate}, "
+        "reshard_after_forward=False"
+    )
 
     # Setup policy groups if enabled
     policy_groups = None
@@ -715,13 +786,14 @@ def main():
         for param in model.vit_model.parameters():
             param.requires_grad = False
 
-    # Setup FSDP and load pretrained model:
-    fsdp_config = FSDPConfig(
+    # Setup FSDP2 and load pretrained model:
+    num_shard = training_args.num_shard
+    num_replicate = training_args.num_replicate
+    fsdp_config = FSDP2Config(
         sharding_strategy=training_args.sharding_strategy,
-        backward_prefetch=training_args.backward_prefetch,
         cpu_offload=training_args.cpu_offload,
-        num_replicate=training_args.num_replicate,
-        num_shard=training_args.num_shard,
+        num_replicate=num_replicate,
+        num_shard=num_shard,
     )
     ema_model = None
     if not training_args.debug:
@@ -733,18 +805,13 @@ def main():
         ref_model = deepcopy(model)
         ref_model.requires_grad_(False)
         ref_model.eval()
-        ref_model = fsdp_wrapper(ref_model, fsdp_config)
+        ref_model = apply_fsdp2_with_activation_checkpointing(ref_model, fsdp_config, use_ac=False)
+        fsdp2_lazy_init_root(ref_model)
     else:
         ref_model = None
 
-    fsdp_model = fsdp_wrapper(model, fsdp_config)
-    apply_activation_checkpointing(
-        fsdp_model,
-        checkpoint_wrapper_fn=functools.partial(
-            checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-        ),
-        check_fn=grad_checkpoint_check_fn,
-    )
+    fsdp_model = apply_fsdp2_with_activation_checkpointing(model, fsdp_config, use_ac=True)
+    fsdp2_lazy_init_root(fsdp_model)
 
     # Setup optimizer and scheduler
     params_to_optimize = list(fsdp_model.parameters())
@@ -776,14 +843,21 @@ def main():
         train_step = 0 if training_args.resume_step == -1 else training_args.resume_step
         data_status = None
     else:
-        optimizer, scheduler, train_step, data_status = (
-            FSDPCheckpoint.try_load_train_state(
+        if resume_from is not None and os.path.isdir(resume_from) and os.path.exists(os.path.join(resume_from, ".metadata")):
+            optimizer, scheduler, train_step, data_status = FSDP2Checkpoint.load_training_state(
+                resume_from,
+                fsdp_model,
+                optimizer,
+                scheduler,
+                fsdp_config,
+            )
+        else:
+            optimizer, scheduler, train_step, data_status = FSDPCheckpoint.try_load_train_state(
                 resume_from,
                 optimizer,
                 scheduler,
                 fsdp_config,
             )
-        )
 
     # setup dataset
     if data_args.dataset_name in ["geneval", "geneval_plus"]:
@@ -830,7 +904,10 @@ def main():
 
     # 创建reward函数
     executor = futures.ThreadPoolExecutor(max_workers=8)
-    if training_args.reward_fn == "geneval":
+    if training_args.debug:
+        reward_fn, eval_reward_fn = build_debug_reward_fns(training_args.reward_fn)
+        logger.info("Debug mode enabled: using local stub reward functions that always return zero.")
+    elif training_args.reward_fn == "geneval":
         reward_fn = geneval_score(reward_urls[dist.get_rank() % len(reward_urls)])
         eval_reward_fn = geneval_score(reward_urls[dist.get_rank() % len(reward_urls)])
     elif training_args.reward_fn == "geneval_plus":
@@ -859,6 +936,8 @@ def main():
         do_sample=training_args.do_sample,
         text_temperature=training_args.text_temperature,
         topk=training_args.top_k,
+        top_p=training_args.top_p,
+        use_static_cache=training_args.use_static_kv_cache,
         cfg_text_scale=training_args.cfg_text_scale,
         cfg_img_scale=training_args.cfg_img_scale,
         cfg_interval=training_args.cfg_interval,
@@ -894,7 +973,9 @@ def main():
     rollout_buffer = RolloutBuffer()
 
     for curr_step in range(train_step, training_args.total_steps):
-        if curr_step % training_args.eval_freq == 0:
+        if training_args.debug and curr_step == train_step:
+            logger.info("Debug mode enabled: skipping initial evaluation loop.")
+        elif curr_step % training_args.eval_freq == 0:
             infer_model.eval()
             eval_generation_kwargs = generation_kwargs.copy()
             eval_generation_kwargs["enable_sde"] = False
@@ -903,10 +984,10 @@ def main():
             eval_generation_kwargs["text_temperature"] = 0.3
             eval_generation_kwargs["reward_fn"] = eval_reward_fn
             eval_generation_kwargs["reward_fn_type"] = training_args.reward_fn
-            if data_args.dataset_name in ["geneval", "geneval_plus"]:
-                eval_log = evaluate_geneval_raw_multi_round(test_dataset, rollout_controller, training_args, data_args, curr_step, generation_kwargs=eval_generation_kwargs, eval_rounds=training_args.eval_rounds)
-            elif data_args.dataset_name == "tiif":
-                eval_log = evaluate_tiif_raw_multi_round(test_dataset, rollout_controller, training_args, data_args, curr_step, generation_kwargs=eval_generation_kwargs, eval_rounds=training_args.eval_rounds)
+            eval_log = evaluate_multi_round(
+                test_dataset, rollout_controller, training_args, data_args, curr_step,
+                generation_kwargs=eval_generation_kwargs, eval_rounds=training_args.eval_rounds,
+            )
             logger.info(f"eval_log: {eval_log}")
             if dist.get_rank() == 0:
                 for key, value in eval_log.items():
@@ -1061,6 +1142,12 @@ def main():
             "img_policy_loss": [],
             "text_kl_loss": [],
             "img_kl_loss": [],
+            "text_prob_ratio_mean": [],
+            "text_prob_ratio_max": [],
+            "text_prob_ratio_min": [],
+            "img_prob_ratio_mean": [],
+            "img_prob_ratio_max": [],
+            "img_prob_ratio_min": [],
         }
         fsdp_model.train()
         optimizer.zero_grad()
@@ -1104,6 +1191,7 @@ def main():
             # repeat advantages to match the length of label_ids
             cur_text_advantages = loss_info.get("text_advantages", None)
             cur_image_advantages = loss_info.get("image_advantages", None)
+            behavior_probs = loss_info.get("inference_probs", None)
             label_ids = loss_info.get("packed_label_ids", None)
             # Step 4: training model with the packed data
             # Forward pass with mixed precision
@@ -1127,24 +1215,46 @@ def main():
 
                 output_dict = fsdp_model(**packed_input)
             if training_args.tune_text_cot:
-                per_token_logps = (
+                raw_per_token_logps = (
                     output_dict["logits"]
                     .log_softmax(dim=-1)
                     .gather(dim=-1, index=label_ids.unsqueeze(-1))
                     .squeeze(-1)
                 )
+                per_token_logps = gather_text_policy_logps(
+                    output_dict["logits"],
+                    label_ids,
+                    do_sample=training_args.do_sample,
+                    temperature=training_args.text_temperature,
+                    topk=training_args.top_k,
+                    top_p=training_args.top_p,
+                )
 
-                per_token_loss = -(
-                    torch.exp(per_token_logps - per_token_logps.detach())
-                    * cur_text_advantages
-                ).sum() / (
-                    1e-4 + total_text_grad_tokens
-                )  # online policy loss
+                if behavior_probs is not None:
+                    behavior_logps = behavior_probs.detach().clamp_min(1e-20).log()
+                    ratio1 = torch.exp(per_token_logps - behavior_logps)
+                    ratio2 = torch.clamp(
+                        ratio1,
+                        min=1.0 - training_args.grpo_clip_ratio,
+                        max=1.0 + training_args.grpo_clip_ratio,
+                    )
+                    per_token_loss = -torch.minimum(
+                        ratio1 * cur_text_advantages,
+                        ratio2 * cur_text_advantages,
+                    ).sum() / (1e-4 + total_text_grad_tokens)
+                    loss_dict["text_prob_ratio_mean"].append(ratio1.mean().item())
+                    loss_dict["text_prob_ratio_max"].append(ratio1.max().item())
+                    loss_dict["text_prob_ratio_min"].append(ratio1.min().item())
+                else:
+                    per_token_loss = -(
+                        torch.exp(per_token_logps - per_token_logps.detach())
+                        * cur_text_advantages
+                    ).sum() / (1e-4 + total_text_grad_tokens)
                 loss_dict["text_policy_loss"].append(per_token_loss.item())
                 if training_args.kl_weight_text > 0:
                     per_token_kl = (
-                        torch.exp(ref_per_token_logps - per_token_logps)
-                        - (ref_per_token_logps - per_token_logps)
+                        torch.exp(ref_per_token_logps - raw_per_token_logps)
+                        - (ref_per_token_logps - raw_per_token_logps)
                         - 1
                     )  # k3 estimation
                     per_token_kl = per_token_kl.sum() / (1e-4 + total_text_grad_tokens)
@@ -1192,9 +1302,28 @@ def main():
                 assert sum(img_latent_lengths) == log_prob.shape[0]
                 log_prob_per_image = torch.stack([x.mean() for x in torch.split(log_prob, img_latent_lengths)]) # (num_images,)
                 logger.info(f"Rank {dist.get_rank()}: log_prob_per_image: {log_prob_per_image}")
-                img_per_token_loss = -(
-                    torch.exp(log_prob_per_image - log_prob_per_image.detach()) * cur_image_advantages.to(log_prob_per_image.dtype)
-                ).sum() / (1e-4 + total_image_num)
+                behavior_log_prob = loss_info.get("log_probs", None)
+                if behavior_log_prob is not None:
+                    behavior_log_prob_per_image = torch.stack(
+                        [x.mean() for x in torch.split(behavior_log_prob.float(), img_latent_lengths)]
+                    )
+                    ratio1 = torch.exp(log_prob_per_image - behavior_log_prob_per_image.detach())
+                    ratio2 = torch.clamp(
+                        ratio1,
+                        min=1.0 - training_args.grpo_clip_ratio,
+                        max=1.0 + training_args.grpo_clip_ratio,
+                    )
+                    img_per_token_loss = -torch.minimum(
+                        ratio1 * cur_image_advantages.to(log_prob_per_image.dtype),
+                        ratio2 * cur_image_advantages.to(log_prob_per_image.dtype),
+                    ).sum() / (1e-4 + total_image_num)
+                    loss_dict["img_prob_ratio_mean"].append(ratio1.mean().item())
+                    loss_dict["img_prob_ratio_max"].append(ratio1.max().item())
+                    loss_dict["img_prob_ratio_min"].append(ratio1.min().item())
+                else:
+                    img_per_token_loss = -(
+                        torch.exp(log_prob_per_image - log_prob_per_image.detach()) * cur_image_advantages.to(log_prob_per_image.dtype)
+                    ).sum() / (1e-4 + total_image_num)
                 loss_dict["img_policy_loss"].append(img_per_token_loss.item())
 
                 img_loss = img_per_token_loss
@@ -1224,7 +1353,10 @@ def main():
             # Backward pass
             loss.backward()
         # Gradient clipping and optimization step
-        total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
+        total_norm = clip_grad_norm_fsdp2(
+            [param for param in fsdp_model.parameters() if param.requires_grad],
+            training_args.max_grad_norm,
+        )
         optimizer.step()
         scheduler.step()
         logger.info(f"Rank {dist.get_rank()}: Total norm: {total_norm.item()}")
@@ -1239,7 +1371,7 @@ def main():
             dist.all_reduce(v_size, op=dist.ReduceOp.AVG)
             loss_dict[k] = v_sum / v_size
         if ema_model is not None:
-            fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
+            fsdp2_ema_update(ema_model, fsdp_model, decay=training_args.ema)
 
         # Log loss values for this batch
         if curr_step % training_args.log_every == 0:
@@ -1249,6 +1381,10 @@ def main():
             steps_per_sec = training_args.log_every / (end_time - start_time)
             message = f"(step={curr_step:07d})  step time: {end_time - start_time:.2f}s"
             wandb_log = {}
+            train_log_values = {
+                f"train/{k}": v.item() if torch.is_tensor(v) else float(v)
+                for k, v in loss_dict.items()
+            }
             wandb_log["step_time"] = end_time - start_time
             # all gather rewards
             for info_key, info_value in additional_stats.items():
@@ -1259,6 +1395,10 @@ def main():
                 else:
                     wandb_log[info_key] = info_value
                     message += f"{info_key}: {info_value:.4f}, "
+
+            for key, value in train_log_values.items():
+                wandb_log[key] = value
+                message += f"{key}: {value:.4f}, "
 
             message += f"Train Steps/Sec: {steps_per_sec:.2f}, "
             logger.info(message)
@@ -1276,13 +1416,12 @@ def main():
             )
             dist.all_reduce(mem_cache, op=dist.ReduceOp.MAX)
             wandb_log["mem_cache"] = mem_cache
-            wandb_log.update({f"train/{k}": v for k, v in loss_dict.items()})
             if dist.get_rank() == 0:
                 wandb.log(wandb_log, step=curr_step)
 
         if curr_step > 0 and (curr_step % training_args.save_every == 0 or curr_step == training_args.total_steps - 1):
             try:
-                FSDPCheckpoint.fsdp_save_ckpt(
+                FSDP2Checkpoint.save_checkpoint(
                     ckpt_dir=training_args.checkpoint_dir,
                     train_steps=curr_step,
                     model=fsdp_model,

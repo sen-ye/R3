@@ -21,8 +21,8 @@ from data.data_utils import (
     patchify, 
 )
 from modeling.diffusion.sde_sampler import SDESampler
-from .qwen2_navit import NaiveCache, Qwen2ForCausalLM, NaiveCacheMultiSeq
-from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding, topk_sampling
+from .qwen2_navit import NaiveCache, Qwen2ForCausalLM, NaiveCacheMultiSeq, StaticKVCache
+from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 
 
 class BagelConfig(PretrainedConfig):
@@ -1219,6 +1219,46 @@ class Bagel(PreTrainedModel):
             return torch.stack([i.to(output_device) for i in generated_sequence], dim=0), past_key_values
         return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
 
+    def _sample_next_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        topk: int,
+        top_p: float,
+        generator: Optional[torch.Generator],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scaled_logits = logits.float() / float(temperature)
+
+        if top_p < 1.0:
+            top_p_k = min(1000, scaled_logits.size(-1))
+            topk_values, topk_indices = torch.topk(scaled_logits, k=top_p_k, dim=-1)
+            logsumexp_all = torch.logsumexp(scaled_logits, dim=-1, keepdim=True)
+            topk_raw_probs = torch.exp(topk_values - logsumexp_all)
+            cumulative_probs = torch.cumsum(topk_raw_probs, dim=-1)
+            topk_mask = cumulative_probs > float(top_p)
+            topk_mask[..., 1:] = topk_mask[..., :-1].clone()
+            topk_mask[..., 0] = False
+            filtered_probs = topk_raw_probs.masked_fill(topk_mask, 0.0)
+            filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+            sampled_indices = torch.multinomial(filtered_probs, num_samples=1, generator=generator)
+            next_tokens = topk_indices.gather(-1, sampled_indices).squeeze(-1)
+            next_tokens_probs = topk_raw_probs.gather(-1, sampled_indices).squeeze(-1)
+            return next_tokens, next_tokens_probs
+
+        if topk > 0:
+            topk_values, topk_indices = torch.topk(scaled_logits, k=min(topk, scaled_logits.size(-1)), dim=-1)
+            probs = F.softmax(topk_values, dim=-1)
+            sampled_indices = torch.multinomial(probs, num_samples=1, generator=generator)
+            next_tokens = topk_indices.gather(-1, sampled_indices).squeeze(-1)
+            next_tokens_probs = probs.gather(-1, sampled_indices).squeeze(-1)
+            return next_tokens, next_tokens_probs
+
+        probs = F.softmax(scaled_logits, dim=-1)
+        sampled_indices = torch.multinomial(probs, num_samples=1, generator=generator)
+        next_tokens = sampled_indices.squeeze(-1)
+        next_tokens_probs = probs.gather(-1, sampled_indices).squeeze(-1)
+        return next_tokens, next_tokens_probs
+
     @torch.no_grad
     def generate_text_batch(
         self,
@@ -1231,21 +1271,23 @@ class Bagel(PreTrainedModel):
         do_sample: bool = False,
         temperature: float = 1.0,
         topk: int = -1,
+        top_p: float = 0.9,
         end_token_id: int = None,
         generator: torch.Generator = None,
     ):
         batch_size = packed_start_tokens.size(0)
         generated_sequence = [[] for _ in range(batch_size)]
+        generated_probs = [[] for _ in range(batch_size)]
         curr_tokens = packed_start_tokens
-        
+
         if past_key_values is None:
             past_key_values = NaiveCacheMultiSeq(num_layers=self.config.llm_config.num_hidden_layers, num_seqs=batch_size)
-        elif not isinstance(past_key_values, NaiveCacheMultiSeq):
-            # Or raise an error if an incompatible cache type is provided
-            raise ValueError("past_key_values must be an instance of NaiveCacheMultiSeq or None for generate_text_batch")
+        elif not isinstance(past_key_values, (NaiveCacheMultiSeq, StaticKVCache)):
+            raise ValueError("past_key_values must be NaiveCacheMultiSeq, StaticKVCache, or None for generate_text_batch")
         elif past_key_values.num_seqs != batch_size:
-            raise ValueError(f"NaiveCacheMultiSeq num_seqs ({past_key_values.num_seqs}) does not match batch_size ({batch_size})")
+            raise ValueError(f"past_key_values.num_seqs ({past_key_values.num_seqs}) does not match batch_size ({batch_size})")
 
+        use_static_cache = isinstance(past_key_values, StaticKVCache)
         active_sequences_original_indices = torch.arange(batch_size, device=curr_tokens.device)
         tqdm_iter = tqdm(range(max_length+1), desc="Thinking...", disable=not (dist.is_initialized() and dist.get_rank() == 0)) # TODO: add one
         for step in tqdm_iter:
@@ -1254,22 +1296,6 @@ class Bagel(PreTrainedModel):
 
             active_curr_tokens = curr_tokens[active_sequences_original_indices]
             active_packed_query_position_ids = packed_query_position_ids[active_sequences_original_indices]
-            active_key_values_lens = key_values_lens[active_sequences_original_indices]
-            
-            num_active_sequences = active_curr_tokens.shape[0]
-            packed_query_indexes = torch.cumsum(active_key_values_lens, dim=0) + torch.arange(
-                0, num_active_sequences, 
-                device=active_key_values_lens.device, 
-                dtype=active_key_values_lens.dtype
-            )
-
-            # compute active packed_key_value_indexes
-            offset = 0
-            active_packed_key_value_indexes = []
-            for i in range(num_active_sequences):
-                active_packed_key_value_indexes.extend(range(offset, offset + active_key_values_lens[i]))
-                offset += (active_key_values_lens[i] + 1)
-            active_packed_key_value_indexes = torch.tensor(active_packed_key_value_indexes, device=active_curr_tokens.device, dtype=torch.long)
 
             packed_text_embedding = self.language_model.model.embed_tokens(active_curr_tokens)
             query_lens_for_model = torch.ones_like(active_curr_tokens)
@@ -1277,46 +1303,95 @@ class Bagel(PreTrainedModel):
             extra_inputs = {}
             if self.use_moe:
                 extra_inputs["mode"] = "und"
-            
-            output = self.language_model.forward_inference(
-                packed_query_sequence=packed_text_embedding,
-                query_lens=query_lens_for_model, 
-                packed_query_position_ids=active_packed_query_position_ids, 
-                packed_query_indexes=packed_query_indexes,
-                past_key_values=past_key_values,      
-                key_values_lens=active_key_values_lens,
-                packed_key_value_indexes=active_packed_key_value_indexes,
-                update_past_key_values=True, 
-                is_causal=True,
-                selected_cache_indices=active_sequences_original_indices,
-                **extra_inputs,
-            )
+
+            if use_static_cache:
+                output = self.language_model.forward_inference(
+                    packed_query_sequence=packed_text_embedding,
+                    query_lens=query_lens_for_model,
+                    packed_query_position_ids=active_packed_query_position_ids,
+                    packed_query_indexes=None,
+                    past_key_values=past_key_values,
+                    key_values_lens=None,
+                    packed_key_value_indexes=None,
+                    update_past_key_values=True,
+                    is_causal=True,
+                    selected_cache_indices=active_sequences_original_indices,
+                    **extra_inputs,
+                )
+                past_key_values = output.past_key_values
+                past_key_values.advance_seq_lens(1, active_sequences_original_indices)
+            else:
+                active_key_values_lens = key_values_lens[active_sequences_original_indices]
+                num_active_sequences = active_curr_tokens.shape[0]
+                packed_query_indexes = torch.cumsum(active_key_values_lens, dim=0) + torch.arange(
+                    0, num_active_sequences,
+                    device=active_key_values_lens.device,
+                    dtype=active_key_values_lens.dtype
+                )
+
+                offset = 0
+                active_packed_key_value_indexes = []
+                for i in range(num_active_sequences):
+                    active_packed_key_value_indexes.extend(range(offset, offset + active_key_values_lens[i]))
+                    offset += (active_key_values_lens[i] + 1)
+                active_packed_key_value_indexes = torch.tensor(
+                    active_packed_key_value_indexes,
+                    device=active_curr_tokens.device,
+                    dtype=torch.long,
+                )
+
+                output = self.language_model.forward_inference(
+                    packed_query_sequence=packed_text_embedding,
+                    query_lens=query_lens_for_model,
+                    packed_query_position_ids=active_packed_query_position_ids,
+                    packed_query_indexes=packed_query_indexes,
+                    past_key_values=past_key_values,
+                    key_values_lens=active_key_values_lens,
+                    packed_key_value_indexes=active_packed_key_value_indexes,
+                    update_past_key_values=True,
+                    is_causal=True,
+                    selected_cache_indices=active_sequences_original_indices,
+                    **extra_inputs,
+                )
             past_key_values = output.past_key_values
 
-            pred_logits = self.language_model.lm_head(output.packed_query_sequence) 
+            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
 
-            next_tokens = topk_sampling(pred_logits, k=topk, temperature=temperature, do_sample=do_sample, generator=generator)
+            if do_sample:
+                next_tokens, _ = self._sample_next_token(
+                    pred_logits,
+                    temperature=temperature,
+                    topk=topk,
+                    top_p=top_p,
+                    generator=generator,
+                )
+            else:
+                next_tokens = torch.argmax(pred_logits, dim=-1)
+            raw_probs = F.softmax(pred_logits.float(), dim=-1)
+            next_tokens_probs = raw_probs.gather(-1, next_tokens.unsqueeze(-1)).squeeze(-1)
 
             still_active_mask_for_next_step = torch.ones_like(active_sequences_original_indices, dtype=torch.bool)
 
             for i, original_batch_idx_tensor in enumerate(active_sequences_original_indices.split(1)):
                 original_batch_idx = original_batch_idx_tensor.item()
-                generated_sequence[original_batch_idx].append(active_curr_tokens[i].item()) # update sampled token to generated sequence when they have been updated to kv cache
+                generated_sequence[original_batch_idx].append(active_curr_tokens[i].item())
 
-                if curr_tokens[original_batch_idx] == end_token_id: # if last generated token is end token, then stop
+                if curr_tokens[original_batch_idx] == end_token_id:
                     still_active_mask_for_next_step[i] = False
                 else:
-                    if step == max_length - 1: # force end token to be generated at the last step
+                    if step == max_length - 1:
                         next_tokens[i] = end_token_id
-                    curr_tokens[original_batch_idx] = next_tokens[i] # update generated token to kv cache
-            
+                    curr_tokens[original_batch_idx] = next_tokens[i]
+                    generated_probs[original_batch_idx].append(next_tokens_probs[i].item())
+
             continuing_original_indices = active_sequences_original_indices[still_active_mask_for_next_step]
             if continuing_original_indices.numel() > 0:
-                key_values_lens[continuing_original_indices] += 1
+                if not use_static_cache:
+                    key_values_lens[continuing_original_indices] += 1
                 packed_query_position_ids[continuing_original_indices] += 1
-            
+
             active_sequences_original_indices = continuing_original_indices
-        return generated_sequence, past_key_values
+        return generated_sequence, generated_probs, past_key_values
      
     # for evaluation
     @torch.no_grad()

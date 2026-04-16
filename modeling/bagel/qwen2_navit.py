@@ -22,7 +22,7 @@ from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
-from flash_attn import flash_attn_varlen_func # type: ignore
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache  # type: ignore
 from modeling.qwen2.modeling_qwen2 import (
     Qwen2Attention, 
     Qwen2MLP, 
@@ -252,10 +252,222 @@ class NaiveCacheMultiSeq:
         return seq_lens
 
 
+class StaticKVCache:
+    """Pre-allocated KV cache for efficient batched inference."""
+
+    def __init__(
+        self,
+        num_layers,
+        batch_size,
+        max_len,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ):
+        self.num_layers = num_layers
+        self.batch_size = batch_size
+        self.max_len = max_len
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        shape = (num_layers, batch_size, max_len, num_kv_heads, head_dim)
+        self.key_cache = torch.zeros(shape, dtype=dtype, device=device)
+        self.value_cache = torch.zeros(shape, dtype=dtype, device=device)
+        self.seq_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+    @property
+    def num_seqs(self):
+        return self.batch_size
+
+    def advance_seq_lens(self, amount, indices=None):
+        if indices is None:
+            self.seq_lens += amount
+        else:
+            self.seq_lens[indices] += amount
+
+
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
     packed_query_sequence: torch.FloatTensor = None
-    past_key_values: Optional[Union[NaiveCache, NaiveCacheMultiSeq]] = None
+    past_key_values: Optional[Union[NaiveCache, NaiveCacheMultiSeq, StaticKVCache]] = None
+
+
+def _normalize_static_cache_indices(selected_cache_indices, device):
+    if selected_cache_indices is None:
+        return None
+    if isinstance(selected_cache_indices, torch.Tensor):
+        return selected_cache_indices.to(device=device, dtype=torch.int32)
+    return torch.tensor(selected_cache_indices, dtype=torch.int32, device=device)
+
+
+def _merge_static_kv_prefix_and_query(
+    packed_key_states,
+    packed_value_states,
+    query_lens,
+    past_key_values,
+    layer_idx,
+    selected_cache_indices=None,
+):
+    num_seqs = len(query_lens)
+    device = packed_key_states.device
+    cache_batch_idx = _normalize_static_cache_indices(selected_cache_indices, device)
+    cache_indices = cache_batch_idx.long() if cache_batch_idx is not None else torch.arange(num_seqs, device=device)
+
+    effective_seqlens = (
+        past_key_values.seq_lens[cache_indices]
+        if cache_batch_idx is not None
+        else past_key_values.seq_lens
+    )
+    total_kv_lens = effective_seqlens + query_lens
+    if total_kv_lens.max().item() > past_key_values.max_len:
+        raise RuntimeError(
+            f"StaticKVCache overflow: need {total_kv_lens.max().item()} tokens, "
+            f"but max_len={past_key_values.max_len}"
+        )
+
+    k_cache = past_key_values.key_cache[layer_idx]
+    v_cache = past_key_values.value_cache[layer_idx]
+    total_kv = total_kv_lens.sum().item()
+    merged_k = packed_key_states.new_empty(total_kv, packed_key_states.shape[-2], packed_key_states.shape[-1])
+    merged_v = packed_value_states.new_empty(total_kv, packed_value_states.shape[-2], packed_value_states.shape[-1])
+    cu_kv = torch.nn.functional.pad(torch.cumsum(total_kv_lens, dim=0), (1, 0))
+
+    total_past = effective_seqlens.sum().item()
+    if total_past > 0:
+        max_past = effective_seqlens.max().item()
+        past_pos = torch.arange(max_past, device=device).unsqueeze(0).expand(num_seqs, -1)
+        past_mask = past_pos < effective_seqlens.unsqueeze(1)
+        batch_idx = cache_indices.unsqueeze(1).expand_as(past_pos)
+        past_k = k_cache[batch_idx[past_mask], past_pos[past_mask]]
+        past_v = v_cache[batch_idx[past_mask], past_pos[past_mask]]
+        past_dest = cu_kv[:-1].unsqueeze(1) + past_pos
+        merged_k[past_dest[past_mask]] = past_k
+        merged_v[past_dest[past_mask]] = past_v
+
+    max_new = query_lens.max().item()
+    new_pos = torch.arange(max_new, device=device).unsqueeze(0).expand(num_seqs, -1)
+    new_mask = new_pos < query_lens.unsqueeze(1)
+    new_dest = (cu_kv[:-1] + effective_seqlens).unsqueeze(1) + new_pos
+    merged_k[new_dest[new_mask]] = packed_key_states
+    merged_v[new_dest[new_mask]] = packed_value_states
+
+    return merged_k, merged_v, total_kv_lens, effective_seqlens, cache_indices, cache_batch_idx
+
+
+def _static_kv_cache_attention(
+    packed_query_states,
+    packed_key_states,
+    packed_value_states,
+    query_lens,
+    past_key_values,
+    layer_idx,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    hidden_size,
+    selected_cache_indices=None,
+    is_causal=True,
+):
+    num_seqs = len(query_lens)
+    device = packed_query_states.device
+    cache_batch_idx = _normalize_static_cache_indices(selected_cache_indices, device)
+    cache_indices = cache_batch_idx.long() if cache_batch_idx is not None else torch.arange(num_seqs, device=device)
+    effective_seqlens = (
+        past_key_values.seq_lens[cache_indices]
+        if cache_batch_idx is not None
+        else past_key_values.seq_lens
+    )
+    if (effective_seqlens + query_lens).max().item() > past_key_values.max_len:
+        raise RuntimeError(
+            f"StaticKVCache overflow: need {(effective_seqlens + query_lens).max().item()} tokens, "
+            f"but max_len={past_key_values.max_len}"
+        )
+
+    k_cache = past_key_values.key_cache[layer_idx]
+    v_cache = past_key_values.value_cache[layer_idx]
+
+    if num_seqs == 1 or (query_lens == query_lens[0]).all():
+        seqlen_q = query_lens[0].item()
+        q = packed_query_states.view(num_seqs, seqlen_q, num_heads, head_dim)
+        k_new = packed_key_states.view(num_seqs, seqlen_q, num_kv_heads, head_dim)
+        v_new = packed_value_states.view(num_seqs, seqlen_q, num_kv_heads, head_dim)
+        packed_attn_output = flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k_new,
+            v=v_new,
+            cache_seqlens=effective_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            causal=is_causal,
+        ).reshape(-1, hidden_size)
+        return packed_attn_output
+
+    merged_k, merged_v, total_kv_lens, effective_seqlens, cache_indices, _ = _merge_static_kv_prefix_and_query(
+        packed_key_states,
+        packed_value_states,
+        query_lens,
+        past_key_values,
+        layer_idx,
+        selected_cache_indices=selected_cache_indices,
+    )
+    cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+    cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(total_kv_lens, dim=0), (1, 0)).to(torch.int32)
+    packed_attn_output = flash_attn_varlen_func(
+        q=packed_query_states,
+        k=merged_k,
+        v=merged_v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=query_lens.max().item(),
+        max_seqlen_k=total_kv_lens.max().item(),
+        causal=is_causal,
+    ).reshape(-1, hidden_size)
+
+    max_new = query_lens.max().item()
+    write_pos = torch.arange(max_new, device=device).unsqueeze(0).expand(num_seqs, -1)
+    write_mask = write_pos < query_lens.unsqueeze(1)
+    write_batch = cache_indices.unsqueeze(1).expand_as(write_pos)
+    write_cache_pos = effective_seqlens.unsqueeze(1) + write_pos
+    k_cache[write_batch[write_mask], write_cache_pos[write_mask]] = packed_key_states
+    v_cache[write_batch[write_mask], write_cache_pos[write_mask]] = packed_value_states
+    return packed_attn_output
+
+
+def _static_kv_cache_readonly_attention(
+    packed_query_states,
+    packed_key_states,
+    packed_value_states,
+    query_lens,
+    past_key_values,
+    layer_idx,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    hidden_size,
+    selected_cache_indices=None,
+    is_causal=False,
+):
+    merged_k, merged_v, total_kv_lens, _, _, _ = _merge_static_kv_prefix_and_query(
+        packed_key_states,
+        packed_value_states,
+        query_lens,
+        past_key_values,
+        layer_idx,
+        selected_cache_indices=selected_cache_indices,
+    )
+    cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+    cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(total_kv_lens, dim=0), (1, 0)).to(torch.int32)
+    return flash_attn_varlen_func(
+        q=packed_query_states,
+        k=merged_k,
+        v=merged_v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=query_lens.max().item(),
+        max_seqlen_k=total_kv_lens.max().item(),
+        causal=is_causal,
+    ).reshape(-1, hidden_size)
 
 
 def pad_sequence(tensor, pad_size):
@@ -347,11 +559,12 @@ class PackedAttention(Qwen2Attention):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
+        past_key_values: Optional[Union[NaiveCache, NaiveCacheMultiSeq, StaticKVCache]] = None,
         key_values_lens: Optional[torch.Tensor] = None,
         packed_key_value_indexes: Optional[torch.Tensor] = None,
         update_past_key_values=True,
         is_causal=True,
+        selected_cache_indices: Optional[List[int]] = None,
     ):
         packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
         packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
@@ -369,13 +582,59 @@ class PackedAttention(Qwen2Attention):
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
-        if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
+        if isinstance(past_key_values, StaticKVCache):
+            if update_past_key_values:
+                packed_attn_output = _static_kv_cache_attention(
+                    packed_query_states,
+                    packed_key_states,
+                    packed_value_states,
+                    query_lens,
+                    past_key_values,
+                    self.layer_idx,
+                    self.num_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self.hidden_size,
+                    selected_cache_indices=selected_cache_indices,
+                    is_causal=is_causal,
+                )
+            else:
+                packed_attn_output = _static_kv_cache_readonly_attention(
+                    packed_query_states,
+                    packed_key_states,
+                    packed_value_states,
+                    query_lens,
+                    past_key_values,
+                    self.layer_idx,
+                    self.num_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self.hidden_size,
+                    selected_cache_indices=selected_cache_indices,
+                    is_causal=is_causal,
+                )
+            return self.o_proj(packed_attn_output), past_key_values
+
+        if past_key_values is not None and isinstance(past_key_values, NaiveCache) and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
             seqlens = sum(query_lens) + sum(key_values_lens)
             merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_key_states[packed_query_indexes] = packed_key_states
+            merged_key_states[packed_key_value_indexes] = past_key_states
+            merged_value_states[packed_query_indexes] = packed_value_states
+            merged_value_states[packed_key_value_indexes] = past_value_states
+            key_values_lens = key_values_lens + query_lens
+        elif past_key_values is not None and isinstance(past_key_values, NaiveCacheMultiSeq) and past_key_values.caches[0].key_cache[self.layer_idx] is not None:
+            past_key_states, past_value_states = past_key_values.get_kv_cache(self.layer_idx, selected_cache_indices)
+            past_key_states = torch.cat(past_key_states, dim=0)
+            past_value_states = torch.cat(past_value_states, dim=0)
+
+            seqlens = sum(query_lens) + sum(key_values_lens)
+            merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_value_states = past_value_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_key_states[packed_query_indexes] = packed_key_states
             merged_key_states[packed_key_value_indexes] = past_key_states
             merged_value_states[packed_query_indexes] = packed_value_states
@@ -403,8 +662,14 @@ class PackedAttention(Qwen2Attention):
         packed_attn_output = self.o_proj(packed_attn_output)
 
         if update_past_key_values:
-            past_key_values.key_cache[self.layer_idx] = merged_key_states
-            past_key_values.value_cache[self.layer_idx] = merged_value_states
+            if isinstance(past_key_values, NaiveCache):
+                past_key_values.key_cache[self.layer_idx] = merged_key_states
+                past_key_values.value_cache[self.layer_idx] = merged_value_states
+            elif isinstance(past_key_values, NaiveCacheMultiSeq):
+                cumsum_lens = [0] + torch.cumsum(key_values_lens, dim=0).tolist()
+                for i, select_idx in enumerate(selected_cache_indices):
+                    past_key_values.caches[select_idx].key_cache[self.layer_idx] = merged_key_states[cumsum_lens[i]:cumsum_lens[i + 1]]
+                    past_key_values.caches[select_idx].value_cache[self.layer_idx] = merged_value_states[cumsum_lens[i]:cumsum_lens[i + 1]]
 
         return packed_attn_output, past_key_values
 
@@ -588,6 +853,44 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
+        if isinstance(past_key_values, StaticKVCache):
+            if update_past_key_values:
+                packed_attn_output = _static_kv_cache_attention(
+                    packed_query_states,
+                    packed_key_states,
+                    packed_value_states,
+                    query_lens,
+                    past_key_values,
+                    self.layer_idx,
+                    self.num_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self.hidden_size,
+                    selected_cache_indices=selected_cache_indices,
+                    is_causal=is_causal,
+                )
+            else:
+                packed_attn_output = _static_kv_cache_readonly_attention(
+                    packed_query_states,
+                    packed_key_states,
+                    packed_value_states,
+                    query_lens,
+                    past_key_values,
+                    self.layer_idx,
+                    self.num_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self.hidden_size,
+                    selected_cache_indices=selected_cache_indices,
+                    is_causal=is_causal,
+                )
+            if mode == 'und':
+                packed_attn_output = self.o_proj(packed_attn_output)
+            elif mode == 'gen':
+                packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+                packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            return packed_attn_output, past_key_values
+
         if past_key_values is not None and isinstance(past_key_values, NaiveCache) and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
@@ -701,11 +1004,12 @@ class Qwen2DecoderLayer(nn.Module):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
+        past_key_values: Optional[Union[NaiveCache, NaiveCacheMultiSeq, StaticKVCache]] = None,
         key_values_lens: Optional[torch.Tensor] = None,
         packed_key_value_indexes: Optional[torch.Tensor] = None,
         update_past_key_values=True,
         is_causal=True,
+        selected_cache_indices: Optional[List[int]] = None,
     ) -> BaseNavitOutputWithPast:
 
         residual = packed_query_sequence
@@ -722,6 +1026,7 @@ class Qwen2DecoderLayer(nn.Module):
             packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=update_past_key_values,
             is_causal=is_causal,
+            selected_cache_indices=selected_cache_indices,
         )
         packed_query_sequence = residual + packed_query_sequence
 
@@ -930,7 +1235,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
+        past_key_values: Optional[Union[NaiveCache, NaiveCacheMultiSeq, StaticKVCache]] = None,
         key_values_lens: Optional[torch.Tensor] = None,
         packed_key_value_indexes: Optional[torch.Tensor] = None,
         update_past_key_values=True,
@@ -938,6 +1243,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        selected_cache_indices: Optional[List[int]] = None,
     ) -> BaseNavitOutputWithPast:
 
         residual = packed_query_sequence
@@ -954,6 +1260,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
             packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=update_past_key_values,
             is_causal=is_causal,
+            selected_cache_indices=selected_cache_indices,
         )
         packed_query_sequence = residual + packed_query_sequence
 
@@ -1091,7 +1398,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
 
         for decoder_layer in self.layers:
-            packed_query_sequence, past_key_values = decoder_layer(
+            actual_layer = getattr(decoder_layer, "_checkpoint_wrapped_module", decoder_layer)
+            packed_query_sequence, past_key_values = actual_layer(
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,

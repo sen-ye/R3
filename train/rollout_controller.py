@@ -9,12 +9,17 @@ from PIL import Image
 import numpy as np
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+try:
+    from torch.distributed.fsdp import FSDPModule
+except ImportError:  # pragma: no cover
+    FSDPModule = ()
 from data.data_utils import (
     get_flattened_position_ids_extrapolate, get_flattened_position_ids_interpolate, 
     patchify,
 )
-from modeling.bagel.qwen2_navit import NaiveCache, NaiveCacheMultiSeq
+from modeling.bagel.qwen2_navit import NaiveCache, NaiveCacheMultiSeq, StaticKVCache
 from modeling.bagel.bagel import Bagel
+from train.fsdp2_utils import fsdp2_rollout_context
 import random
 import re
 from dataclasses import dataclass, field
@@ -39,6 +44,9 @@ class RolloutStepResult:
     
     need_vae: bool = True
     need_vit: bool = True
+
+    generated_ids: List[int] = field(default_factory=list)
+    generated_probs: List[float] = field(default_factory=list)
 
 
     # only need when output_list contains image and need loss
@@ -66,6 +74,8 @@ class RolloutStepResult:
 
 
 class MultiRoundRolloutController:
+    FLEX_ATTN_BLOCK_SIZE = 128
+
     def __init__(self, model:Bagel, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids, sde_sampler):
         self.model = model
         self.vae_model = vae_model
@@ -87,18 +97,133 @@ class MultiRoundRolloutController:
     def context(self):
         torch.cuda.empty_cache()
         self.model.eval()
-        with FSDP.summon_full_params(self.model,recurse=False,writeback=False):
+        if isinstance(self.model, FSDP):
+            with FSDP.summon_full_params(self.model, recurse=False, writeback=False):
+                yield
+        elif isinstance(self.model, FSDPModule):
+            with fsdp2_rollout_context(self.model):
+                yield
+        else:
             yield
         torch.cuda.empty_cache()
         
-    def init_gen_context(self, batch_size:int = 1, multi_seq: bool = False,): 
+    def init_gen_context(
+        self,
+        batch_size: int = 1,
+        multi_seq: bool = False,
+        use_static_cache: bool = True,
+        max_cache_len: int = 4096,
+    ):
         num_layers = self.model.config.llm_config.num_hidden_layers
+        if use_static_cache:
+            llm_config = self.unwrapped_model.config.llm_config
+            past_key_values = StaticKVCache(
+                num_layers=num_layers,
+                batch_size=batch_size,
+                max_len=max_cache_len,
+                num_kv_heads=llm_config.num_key_value_heads,
+                head_dim=llm_config.hidden_size // llm_config.num_attention_heads,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        else:
+            past_key_values = NaiveCacheMultiSeq(num_layers, batch_size) if multi_seq else NaiveCache(num_layers)
         gen_context = {
             'kv_lens': [0] * batch_size,
             'ropes': [0] * batch_size,
-            'past_key_values': NaiveCacheMultiSeq(num_layers, batch_size) if multi_seq else NaiveCache(num_layers),
+            'past_key_values': past_key_values,
         }
         return gen_context
+
+    @staticmethod
+    def _pad_to_multiple(value: int, multiple: int = 128) -> int:
+        return ((int(value) + multiple - 1) // multiple) * multiple
+
+    @staticmethod
+    def _normalize_image_shapes(image_shapes, batch_size: int):
+        if isinstance(image_shapes, tuple):
+            return [tuple(image_shapes)] * batch_size
+        normalized_shapes = [tuple(shape) for shape in image_shapes]
+        if len(normalized_shapes) == 1 and batch_size > 1:
+            return normalized_shapes * batch_size
+        return normalized_shapes
+
+    def _estimate_text_block_len(self, text: str) -> int:
+        return len(self.tokenizer.encode(text)) + 2
+
+    def _estimate_vit_block_len(self, image: Image.Image) -> int:
+        resized = self.vit_transform.resize_transform(image)
+        width, height = resized.size
+        return (height // self.vit_transform.stride) * (width // self.vit_transform.stride) + 2
+
+    def _estimate_vae_block_len(self, image: Image.Image) -> int:
+        resized = self.vae_transform.resize_transform(image)
+        width, height = resized.size
+        return (height // self.vae_transform.stride) * (width // self.vae_transform.stride) + 2
+
+    def _estimate_vae_latent_block_len_from_shape(self, image_shape) -> int:
+        height, width = tuple(image_shape)
+        return (height // self.unwrapped_model.latent_downsample) * (
+            width // self.unwrapped_model.latent_downsample
+        ) + 2
+
+    def estimate_gen_image_cache_len(
+        self,
+        prompts: List[str],
+        image_shapes,
+        think: bool,
+        max_output_token_n: int,
+    ) -> int:
+        normalized_shapes = self._normalize_image_shapes(image_shapes, len(prompts))
+        text_prefix = [self._estimate_text_block_len(prompt) for prompt in prompts]
+        image_query = [
+            self._estimate_vae_latent_block_len_from_shape(shape)
+            for shape in normalized_shapes
+        ]
+        if think:
+            think_prefix = self._estimate_text_block_len(GEN_THINK_SYSTEM_PROMPT)
+            text_prefix = [prefix + think_prefix for prefix in text_prefix]
+            text_prefix = [prefix + max_output_token_n + 2 for prefix in text_prefix]
+        total_lens = [
+            prefix_len + image_query_len
+            for prefix_len, image_query_len in zip(text_prefix, image_query)
+        ]
+        return self._pad_to_multiple(max(total_lens), 128)
+
+    def estimate_edit_think_cache_len(
+        self,
+        input_imgs: List[Image.Image],
+        prompts: List[str],
+        max_output_token_n: int,
+        add_understand_think: bool,
+    ) -> int:
+        cache_lens = []
+        think_prefix = self._estimate_text_block_len(VLM_THINK_SYSTEM_PROMPT) if add_understand_think else 0
+        for image, prompt in zip(input_imgs, prompts):
+            curr_len = think_prefix
+            curr_len += self._estimate_vit_block_len(image)
+            curr_len += self._estimate_text_block_len(prompt)
+            curr_len += max_output_token_n + 2
+            cache_lens.append(curr_len)
+        return self._pad_to_multiple(max(cache_lens), 128)
+
+    def estimate_edit_image_cache_len(
+        self,
+        input_imgs: List[Image.Image],
+        edit_operations: List[str],
+    ) -> int:
+        max_cache_len = 0
+        for image, edit_text in zip(input_imgs, edit_operations):
+            image_prefix = self._estimate_vae_block_len(image) + self._estimate_vit_block_len(image)
+            text_prefix = self._estimate_text_block_len(edit_text)
+            latent_query = self._estimate_vae_block_len(image)
+            max_cache_len = max(
+                max_cache_len,
+                image_prefix + text_prefix + latent_query,
+                image_prefix + latent_query,
+                text_prefix + latent_query,
+            )
+        return self._pad_to_multiple(max_cache_len, 128)
 
     @torch.no_grad()
     def update_context_text(self, text, gen_context):
@@ -120,7 +245,11 @@ class MultiRoundRolloutController:
                                                                **generation_input)     
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
-        gen_context['past_key_values'] = past_key_values        
+        gen_context['past_key_values'] = past_key_values
+        if isinstance(past_key_values, StaticKVCache):
+            past_key_values.seq_lens[:] = torch.tensor(
+                kv_lens, dtype=torch.int32, device=past_key_values.seq_lens.device
+            )
         return gen_context
 
     @torch.no_grad()
@@ -160,6 +289,10 @@ class MultiRoundRolloutController:
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
         gen_context['past_key_values'] = past_key_values
+        if isinstance(past_key_values, StaticKVCache):
+            past_key_values.seq_lens[:] = torch.tensor(
+                kv_lens, dtype=torch.int32, device=past_key_values.seq_lens.device
+            )
         
         return gen_context
 
@@ -367,6 +500,7 @@ class MultiRoundRolloutController:
         do_sample: bool = True,
         text_temperature: float = 0.3,
         topk: int = -1,
+        top_p: float = 0.9,
         cfg_text_scale=3.0,
         cfg_interval=[0.4, 1.0],
         timestep_shift=3.0,
@@ -377,11 +511,17 @@ class MultiRoundRolloutController:
         enable_sde: bool = False,
         generator: torch.Generator = None,
         sde_timestep_idx: List[int] = None,
+        use_static_cache: bool = True,
+        max_cache_len: Optional[int] = None,
     ):
         batch_size = len(prompts)
         batch_rollout_output = [[] for _ in range(batch_size)]
         extra_info = {}
-        gen_context = self.init_gen_context(batch_size, multi_seq=True)
+        if max_cache_len is None:
+            max_cache_len = self.estimate_gen_image_cache_len(
+                prompts, image_shapes, think, max_output_token_n
+            )
+        gen_context = self.init_gen_context(batch_size, multi_seq=True, use_static_cache=use_static_cache, max_cache_len=max_cache_len)
         cfg_text_context = deepcopy(gen_context)
         cfg_img_context = deepcopy(gen_context)
         rollout_output_list = [RolloutStepResult(round_idx=round_idx, sample_idx=i) for i in range(batch_size)]
@@ -409,12 +549,13 @@ class MultiRoundRolloutController:
             kv_lens = gen_context['kv_lens']
             ropes = gen_context['ropes']
             generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
-            generations, past_key_values = self.model.generate_text_batch(
+            generations, generated_probs, past_key_values = self.model.generate_text_batch(
                 past_key_values=past_key_values,
                 max_length=max_output_token_n,
                 do_sample=do_sample,
                 temperature=text_temperature,
                 topk=topk,
+                top_p=top_p,
                 end_token_id=self.new_token_ids['eos_token_id'],
                 generator=generator,
                 **generation_input,
@@ -429,7 +570,10 @@ class MultiRoundRolloutController:
                 per_sample_format_rewards.append(self.get_think_format_reward(output_text, must_end_with_think=True))
                 ropes[i] += cot_lengths[i]
             extra_info[f"Round_{round_idx}/per_sample_format_rewards"] = per_sample_format_rewards
-            kv_lens = past_key_values.get_seq_lens(range(batch_size))
+            if isinstance(past_key_values, StaticKVCache):
+                kv_lens = past_key_values.seq_lens.tolist()
+            else:
+                kv_lens = past_key_values.get_seq_lens(range(batch_size))
             gen_context['kv_lens'] = kv_lens
             gen_context['ropes'] = ropes
             gen_context['past_key_values'] = past_key_values
@@ -438,6 +582,8 @@ class MultiRoundRolloutController:
                 rollout_output_list[i].output_list.append(think_output_texts[i])
                 rollout_output_list[i].content_type_list.append("text")
                 rollout_output_list[i].need_loss_list.append(True)
+                rollout_output_list[i].generated_ids = list(generations[i])
+                rollout_output_list[i].generated_probs = list(generated_probs[i])
         else:
             extra_info[f"Round_{round_idx}/per_sample_format_rewards"] = [0.0] * batch_size
             extra_info[f"Round_{round_idx}/mean_cot_length"] = 0.0
@@ -494,14 +640,21 @@ class MultiRoundRolloutController:
         do_sample: bool = True,
         text_temperature: float = 0.3,
         topk: int = -1,
+        top_p: float = 0.9,
         use_vae_feature: bool = True,
         generator: torch.Generator = None,
         add_understand_think: bool = True,
+        use_static_cache: bool = True,
+        max_cache_len: Optional[int] = None,
     ):
         batch_size = len(input_imgs)
         batch_rollout_output = [[] for _ in range(batch_size)]
         extra_info = {}
-        gen_context = self.init_gen_context(batch_size, multi_seq=True)
+        if max_cache_len is None:
+            max_cache_len = self.estimate_edit_think_cache_len(
+                input_imgs, prompts, max_output_token_n, add_understand_think
+            )
+        gen_context = self.init_gen_context(batch_size, multi_seq=True, use_static_cache=use_static_cache, max_cache_len=max_cache_len)
         if add_understand_think:
             system_prompt = VLM_THINK_SYSTEM_PROMPT
             gen_context = self.update_context_text([system_prompt] * batch_size, gen_context)
@@ -511,12 +664,13 @@ class MultiRoundRolloutController:
         kv_lens = gen_context['kv_lens']
         ropes = gen_context['ropes']
         generation_input = self.unwrapped_model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
-        generations, past_key_values = self.unwrapped_model.generate_text_batch(
+        generations, generated_probs, past_key_values = self.unwrapped_model.generate_text_batch(
             past_key_values=past_key_values,
             max_length=max_output_token_n,
             do_sample=do_sample,
             temperature=text_temperature,
             topk=topk,
+            top_p=top_p,
             end_token_id=self.new_token_ids['eos_token_id'],
             generator=generator,
             **generation_input,
@@ -549,6 +703,8 @@ class MultiRoundRolloutController:
             rollout_result.output_list.append(think_output_texts[i])
             rollout_result.content_type_list.append("text")
             rollout_result.need_loss_list.append(True)
+            rollout_result.generated_ids = list(generations[i])
+            rollout_result.generated_probs = list(generated_probs[i])
             batch_rollout_output[i].append(rollout_result)
 
         return think_output_texts, batch_rollout_output, extra_info
@@ -564,6 +720,7 @@ class MultiRoundRolloutController:
         do_sample: bool = True,
         text_temperature: float = 0.3,
         topk: int = -1,
+        top_p: float = 0.9,
         cfg_text_scale=3.0,
         cfg_img_scale=1.5,
         cfg_interval=[0.4, 1.0],
@@ -574,12 +731,16 @@ class MultiRoundRolloutController:
         initial_noise=None,
         enable_sde: bool = False,
         sde_timestep_idx: torch.Tensor = None,
+        use_static_cache: bool = True,
+        max_cache_len: Optional[int] = None,
     ):
         batch_size = len(input_imgs)
         image_shapes = [input_imgs[0].size[::-1]] * batch_size
         batch_rollout_output = [[] for _ in range(batch_size)]
         extra_info = {}
-        gen_context = self.init_gen_context(batch_size, multi_seq=True)
+        if max_cache_len is None:
+            max_cache_len = self.estimate_edit_image_cache_len(input_imgs, edit_operations)
+        gen_context = self.init_gen_context(batch_size, multi_seq=True, use_static_cache=use_static_cache, max_cache_len=max_cache_len)
         cfg_img_context = deepcopy(gen_context)
         cfg_text_context = deepcopy(gen_context)
 
@@ -678,6 +839,7 @@ class MultiRoundRolloutController:
         do_sample: bool = True,
         text_temperature: float = 0.3,
         topk: int = -1,
+        top_p: float = 0.9,
         think: bool = True,
         cfg_text_scale=3.0,
         cfg_img_scale=1.5,
@@ -698,6 +860,8 @@ class MultiRoundRolloutController:
         generator: torch.Generator = None,
         sde_timestep_idx: List[int] = None,
         auto_stop: bool = True,
+        use_static_cache: bool = True,
+        max_cache_len: Optional[int] = None,
     ):
         batch_size = len(prompts)
         image_shapes = [image_shapes] * batch_size
@@ -733,6 +897,7 @@ class MultiRoundRolloutController:
                         do_sample=do_sample,
                         text_temperature=text_temperature,
                         topk=topk,
+                        top_p=top_p,
                         cfg_text_scale=cfg_text_scale,
                         cfg_interval=cfg_interval,
                         timestep_shift=timestep_shift,
@@ -743,6 +908,8 @@ class MultiRoundRolloutController:
                         enable_sde=enable_sde,
                         generator=generator,
                         sde_timestep_idx=sde_timestep_idx,
+                        use_static_cache=use_static_cache,
+                        max_cache_len=max_cache_len,
                     )
                     output_dict[f'Round_{round_idx}/mean_cot_length'] = extra_info[f'Round_{round_idx}/mean_cot_length']
                     for i in range(batch_size):
@@ -761,8 +928,11 @@ class MultiRoundRolloutController:
                         do_sample=do_sample,
                         text_temperature=text_temperature,
                         topk=topk,
+                        top_p=top_p,
                         use_vae_feature=False,
                         generator=generator,
+                        use_static_cache=use_static_cache,
+                        max_cache_len=max_cache_len,
                     )
                     output_dict[f'Round_{round_idx}/mean_cot_length'] = extra_info[f'Round_{round_idx}/mean_cot_length']
                     for i in range(batch_size):
@@ -791,6 +961,7 @@ class MultiRoundRolloutController:
                         do_sample=do_sample,
                         text_temperature=text_temperature,
                         topk=topk,
+                        top_p=top_p,
                         cfg_text_scale=cfg_text_scale,
                         cfg_img_scale=cfg_img_scale,
                         cfg_interval=cfg_interval,
@@ -801,6 +972,8 @@ class MultiRoundRolloutController:
                         initial_noise=initial_noise[round_idx] if initial_noise is not None else None,
                         enable_sde=enable_sde,
                         sde_timestep_idx=sde_timestep_idx,
+                        use_static_cache=use_static_cache,
+                        max_cache_len=max_cache_len,
                     )
 
                     for i in range(batch_size):
@@ -853,6 +1026,7 @@ class MultiRoundRolloutController:
         image_shapes: Tuple[int, int] = (1024, 1024),
         initial_noise: Optional[List[torch.Tensor]] = None,
         topk: int = -1,
+        top_p: float = 0.9,
         executor: Optional[Executor] = None,
         reward_fn: Callable = None, # reward function for each round, return a list of rewards for each sample
         reward_fn_type: str = "unified_reward", # unified_reward or geneval
@@ -862,6 +1036,8 @@ class MultiRoundRolloutController:
         generator: torch.Generator = None,
         input_imgs: List[Image.Image] = None,
         sde_timestep_idx: List[int] = None,
+        use_static_cache: bool = True,
+        max_cache_len: Optional[int] = None,
     ):
         assert rounds >= 1, "rounds must be >= 1"
         
@@ -894,6 +1070,7 @@ class MultiRoundRolloutController:
                         do_sample=do_sample,
                         text_temperature=text_temperature,
                         topk=topk,
+                        top_p=top_p,
                         cfg_text_scale=cfg_text_scale,
                         cfg_interval=cfg_interval,
                         timestep_shift=timestep_shift,
@@ -904,6 +1081,8 @@ class MultiRoundRolloutController:
                         enable_sde=enable_sde,
                         generator=generator,
                         sde_timestep_idx=sde_timestep_idx,
+                        use_static_cache=use_static_cache,
+                        max_cache_len=max_cache_len,
                     )
                     output_dict[f'Round_{round_idx}/mean_cot_length'] = extra_info[f'Round_{round_idx}/mean_cot_length']
                     for i in range(batch_size):
@@ -924,8 +1103,11 @@ class MultiRoundRolloutController:
                         do_sample=do_sample,
                         text_temperature=text_temperature,
                         topk=topk,
+                        top_p=top_p,
                         use_vae_feature=False,
                         generator=generator,
+                        use_static_cache=use_static_cache,
+                        max_cache_len=max_cache_len,
                     )
                     output_dict[f'Round_{actual_round_idx}/mean_cot_length'] = extra_info[f'Round_{actual_round_idx}/mean_cot_length']
                     for i in range(batch_size):
@@ -945,6 +1127,7 @@ class MultiRoundRolloutController:
                         do_sample=do_sample,
                         text_temperature=text_temperature,
                         topk=topk,
+                        top_p=top_p,
                         cfg_text_scale=cfg_text_scale,
                         cfg_img_scale=cfg_img_scale,
                         cfg_interval=cfg_interval,
@@ -955,6 +1138,8 @@ class MultiRoundRolloutController:
                         initial_noise=initial_noise[round_idx],
                         enable_sde=enable_sde,
                         sde_timestep_idx=sde_timestep_idx,
+                        use_static_cache=use_static_cache,
+                        max_cache_len=max_cache_len,
                     )
 
                     for i in range(batch_size):
@@ -1020,8 +1205,11 @@ class MultiRoundRolloutController:
                         step_result_list[0].need_loss_list[idx] &= with_text_loss
                         sample_has_loss |= step_result_list[0].need_loss_list[idx]
                         if step_result_list[0].need_loss_list[idx]:
-                            text_tokens = self.tokenizer.encode(step_result_list[0].output_list[idx])
-                            total_text_grad_tokens += (len(text_tokens) - 1)
+                            if step_result_list[0].generated_ids:
+                                total_text_grad_tokens += max(len(step_result_list[0].generated_ids) - 2, 0)
+                            else:
+                                text_tokens = self.tokenizer.encode(step_result_list[0].output_list[idx])
+                                total_text_grad_tokens += (len(text_tokens) - 1)
                     elif content_type == "image_and_latent":
                         step_result_list[0].need_loss_list[idx] &= with_img_loss
                         sample_has_loss |= step_result_list[0].need_loss_list[idx]
@@ -1097,6 +1285,7 @@ class MultiRoundRolloutController:
         return {
             'text_advantages': [],
             'image_advantages': [],
+            'inference_probs': [],
             'dts': [],
             'log_probs': [],
             'packed_label_ids': [],
@@ -1107,8 +1296,34 @@ class MultiRoundRolloutController:
             'patchified_vae_latent_shapes_for_loss': [],
             'mse_condition_token_indexes': [],
         }
+
+    def pad_sample_to_block_boundary(self, packed_input, curr_pos, sample_start, curr_rope_id):
+        sample_len = curr_pos - sample_start
+        pad_len = (-sample_len) % self.FLEX_ATTN_BLOCK_SIZE
+        if pad_len == 0:
+            return curr_pos, curr_rope_id
+
+        pad_token_id = self.new_token_ids['eos_token_id']
+        packed_input['packed_text_ids'].extend([pad_token_id] * pad_len)
+        packed_input['packed_text_indexes'].extend(range(curr_pos, curr_pos + pad_len))
+        packed_input['packed_position_ids'].extend(range(curr_rope_id, curr_rope_id + pad_len))
+        packed_input['split_lens'].append(pad_len)
+        packed_input['attn_modes'].append("causal")
+        return curr_pos + pad_len, curr_rope_id + pad_len
     
-    def add_text(self, text, packed_input, loss_info, with_loss=False, advantage=0, curr_pos=0, curr_rope_id=0):
+    def add_text(
+        self,
+        text,
+        packed_input,
+        loss_info,
+        with_loss=False,
+        advantage=0,
+        curr_pos=0,
+        curr_rope_id=0,
+        text_ids=None,
+        inference_probs=None,
+        remove_eos_token_loss=False,
+    ):
         """
         Add text to packed input structure.
         
@@ -1125,8 +1340,11 @@ class MultiRoundRolloutController:
             Updated curr_pos, curr_rope_id
         """
         # Encode text
-        text_ids = self.tokenizer.encode(text)
-        full_text_ids = [self.new_token_ids['bos_token_id']] + text_ids + [self.new_token_ids['eos_token_id']]
+        if text_ids is None:
+            token_ids = self.tokenizer.encode(text)
+            full_text_ids = [self.new_token_ids['bos_token_id']] + token_ids + [self.new_token_ids['eos_token_id']]
+        else:
+            full_text_ids = [int(token_id) for token_id in text_ids]
         full_text_len = len(full_text_ids)
         
         # Add to packed input
@@ -1136,10 +1354,19 @@ class MultiRoundRolloutController:
         
         # Add loss information if needed
         if with_loss:
-            packed_input['ce_loss_indexes'].extend(range(curr_pos, curr_pos + full_text_len - 1))
-            loss_info['ce_loss_weights'].extend([1.0] * (full_text_len - 1))
-            loss_info['packed_label_ids'].extend(full_text_ids[1:])
-            loss_info['text_advantages'].extend([advantage] * (full_text_len - 1))
+            label_ids = full_text_ids[1:-1] if remove_eos_token_loss else full_text_ids[1:]
+            loss_len = len(label_ids)
+            packed_input['ce_loss_indexes'].extend(range(curr_pos, curr_pos + loss_len))
+            loss_info['ce_loss_weights'].extend([1.0] * loss_len)
+            loss_info['packed_label_ids'].extend(label_ids)
+            loss_info['text_advantages'].extend([advantage] * loss_len)
+            if inference_probs is not None:
+                behavior_probs = [float(prob) for prob in inference_probs[:loss_len]]
+                if len(behavior_probs) != loss_len:
+                    raise ValueError(
+                        f"Text behavior probs misaligned: expected {loss_len}, got {len(behavior_probs)}"
+                    )
+                loss_info['inference_probs'].extend(behavior_probs)
         
         # Update split info
         packed_input['split_lens'].append(full_text_len)
@@ -1388,6 +1615,8 @@ class MultiRoundRolloutController:
                     if content_type == 'text':
                         # CFG text doesn't contribute to loss
                         with_loss = need_loss and not (data_point.is_cfg_text or data_point.is_cfg_img)
+                        behavior_probs = data_point.generated_probs if with_loss and data_point.generated_probs else None
+                        text_ids = data_point.generated_ids if with_loss and data_point.generated_ids else None
                         curr_pos, curr_rope_id = self.add_text(
                             text=output,
                             packed_input=packed_input,
@@ -1395,7 +1624,10 @@ class MultiRoundRolloutController:
                             with_loss=with_loss,
                             advantage=text_adv,
                             curr_pos=curr_pos,
-                            curr_rope_id=curr_rope_id
+                            curr_rope_id=curr_rope_id,
+                            text_ids=text_ids,
+                            inference_probs=behavior_probs,
+                            remove_eos_token_loss=behavior_probs is not None,
                         )
                         
                     elif content_type == 'image':
@@ -1461,21 +1693,18 @@ class MultiRoundRolloutController:
                                 noisy_latent_idx += num_tokens_per_latent
 
 
+                curr_pos, curr_rope_id = self.pad_sample_to_block_boundary(
+                    packed_input=packed_input,
+                    curr_pos=curr_pos,
+                    sample_start=sample_start,
+                    curr_rope_id=curr_rope_id,
+                )
                 sample_len = curr_pos - sample_start
                 packed_input['sample_lens'].append(sample_len)
             noisy_latent_cnt += num_noisy_latent
         
         # Post-process and convert to tensors
         packed_input['sequence_length'] = curr_pos
-        
-        # Handle padding
-        pad_len = 65536 - curr_pos
-        if pad_len > 0:
-            packed_input['split_lens'].append(pad_len)
-            packed_input['attn_modes'].append('causal')
-            packed_input['sample_lens'].append(pad_len)
-        elif pad_len < 0:
-            raise ValueError(f"Sequence too long: {curr_pos} > 65536")
         
         # Convert lists to tensors
         self._convert_to_tensors(packed_input, loss_info, device)
@@ -1539,6 +1768,9 @@ class MultiRoundRolloutController:
         # Convert loss_info lists to tensors  
         if loss_info['text_advantages']: loss_info['text_advantages'] = torch.tensor(loss_info['text_advantages'], dtype=torch.float32, device=device)
         else: loss_info['text_advantages'] = None
+
+        if loss_info['inference_probs']: loss_info['inference_probs'] = torch.tensor(loss_info['inference_probs'], dtype=torch.float32, device=device)
+        else: loss_info['inference_probs'] = None
             
         if loss_info['image_advantages']: loss_info['image_advantages'] = torch.tensor(loss_info['image_advantages'], dtype=torch.float32, device=device)
         else: loss_info['image_advantages'] = None
